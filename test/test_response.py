@@ -786,6 +786,74 @@ class TestResponse(object):
             next(reader)
         assert re.match("I/O operation on closed file.?", str(ctx.value))
 
+    def test_read_with_illegal_mix_decode_toggle(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foo")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+
+        assert resp.read(1) == b"f"
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"Calling read\(decode_content=False\) is not supported after "
+                r"read\(decode_content=True\) was called"
+            ),
+        ):
+            resp.read(1, decode_content=False)
+
+    def test_read_with_mix_decode_toggle(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foo")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+        resp.read(1, decode_content=False)
+        assert resp.read(1, decode_content=True) == b"o"
+
+    def test_drain_conn_does_not_decode_content(self):
+        # A tiny gzip payload expanding to 8 MiB. Draining the connection of a
+        # redirect response must read it off the wire without expanding it.
+        content_length = 8 * 2 ** 20
+        compressed = gzip.compress(b"\0" * content_length)
+        assert len(compressed) < content_length // 100
+
+        fp = BytesIO(compressed)
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "gzip"}, preload_content=False
+        )
+
+        with mock.patch("urllib3.response.GzipDecoder.decompress") as decompress:
+            resp.drain_conn()
+
+        assert not decompress.called
+        assert not resp._has_decoded_content
+        # The body was consumed from the wire, it just was never decoded.
+        assert resp.tell() == len(compressed)
+
+    def test_drain_conn_keeps_decoding_after_decoded_read(self):
+        fp = BytesIO(gzip.compress(b"foobar"))
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "gzip"}, preload_content=False
+        )
+
+        assert resp.read(3) == b"foo"
+        assert resp._has_decoded_content
+
+        # Once the caller started reading decoded content, draining has to keep
+        # decoding instead of tripping the mixed decode toggle guard.
+        resp.drain_conn()
+
     def test_streaming(self):
         fp = BytesIO(b"foo")
         resp = HTTPResponse(fp, preload_content=False)
